@@ -1,0 +1,6 @@
+{
+  "name": "Singapore Real-Time Weather",
+  "description": "Live Singapore weather panel with real-time 2-hour forecasts, air temperature, rainfall, and relative humidity from data.gov.sg NEA weather stations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
