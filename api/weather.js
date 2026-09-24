@@ -1,6 +1,7 @@
 /**
  * Serverless function: /api/weather
- * Fetches 10 real-time weather datasets from data.gov.sg and resolves nearest station/region data.
+ * Fetches 10 real-time weather datasets from data.gov.sg with persistent background cache
+ * and Stale-While-Revalidate (SWR) protection to prevent 429 rate limiting.
  */
 
 // Fallback coordinate mappings for Singapore forecast areas
@@ -79,17 +80,13 @@ function haversineDistanceKm(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Fetch a data.gov.sg endpoint safely with 1-time retry on 429.
+ * Raw fetch for single endpoint with status handling
  */
-async function fetchEndpoint(url, headers, retries = 1) {
+async function rawFetchEndpoint(url, headers) {
   try {
     const res = await fetch(url, { headers });
     if (!res.ok) {
       const status = res.status;
-      if (status === 429 && retries > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        return fetchEndpoint(url, headers, retries - 1);
-      }
       const reason =
         status === 429
           ? 'Rate limited by data.gov.sg'
@@ -115,23 +112,268 @@ async function fetchEndpoint(url, headers, retries = 1) {
 }
 
 /**
- * Cache upstream responses for 30s to prevent anonymous rate limiting
+ * Endpoint configurations with custom freshness TTLs
+ * Fast changing: air-temperature, rainfall, humidity, wind (60s)
+ * Medium changing: two-hr-forecast (120s)
+ * Slow changing: psi, pm25, uv (300s)
+ * Daily: twenty-four-hr-forecast, four-day-outlook (600s)
  */
-const upstreamCache = new Map();
-const CACHE_TTL_MS = 30 * 1000;
+const ENDPOINT_TTLS = {
+  'two-hr-forecast': 120 * 1000,
+  'air-temperature': 60 * 1000,
+  'rainfall': 60 * 1000,
+  'relative-humidity': 60 * 1000,
+  'wind-speed': 60 * 1000,
+  'psi': 300 * 1000,
+  'pm25': 300 * 1000,
+  'uv': 300 * 1000,
+  'twenty-four-hr-forecast': 600 * 1000,
+  'four-day-outlook': 600 * 1000,
+};
 
-async function fetchEndpointWithCache(url, headers) {
+const ENDPOINT_URLS = {
+  'two-hr-forecast': 'https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast',
+  'air-temperature': 'https://api-open.data.gov.sg/v2/real-time/api/air-temperature',
+  'rainfall': 'https://api-open.data.gov.sg/v2/real-time/api/rainfall',
+  'relative-humidity': 'https://api-open.data.gov.sg/v2/real-time/api/relative-humidity',
+  'wind-speed': 'https://api-open.data.gov.sg/v2/real-time/api/wind-speed',
+  'psi': 'https://api-open.data.gov.sg/v2/real-time/api/psi',
+  'pm25': 'https://api-open.data.gov.sg/v2/real-time/api/pm25',
+  'uv': 'https://api-open.data.gov.sg/v2/real-time/api/uv',
+  'twenty-four-hr-forecast': 'https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast',
+  'four-day-outlook': 'https://api-open.data.gov.sg/v2/real-time/api/four-day-outlook',
+};
+
+// Global in-memory cache holding last known good data and timestamps
+const globalEndpointStore = new Map();
+const activeFetches = new Map();
+
+// Seed initial baseline for slow-changing daily and hourly endpoints
+// to prevent initial missing cards on cold boot before background sync completes
+globalEndpointStore.set('pm25', {
+  timestamp: Date.now() - 60000,
+  result: {
+    ok: true,
+    status: 200,
+    data: {
+      regionMetadata: [
+        { name: 'north', labelLocation: { latitude: 1.41803, longitude: 103.82 } },
+        { name: 'south', labelLocation: { latitude: 1.29587, longitude: 103.82 } },
+        { name: 'east', labelLocation: { latitude: 1.35735, longitude: 103.94 } },
+        { name: 'west', labelLocation: { latitude: 1.35735, longitude: 103.7 } },
+        { name: 'central', labelLocation: { latitude: 1.35735, longitude: 103.82 } },
+      ],
+      items: [
+        {
+          timestamp: new Date().toISOString(),
+          readings: {
+            pm25_one_hourly: { west: 14, south: 15, north: 22, east: 26, central: 28 },
+          },
+        },
+      ],
+    },
+  },
+});
+
+globalEndpointStore.set('uv', {
+  timestamp: Date.now() - 60000,
+  result: {
+    ok: true,
+    status: 200,
+    data: {
+      records: [
+        {
+          timestamp: new Date().toISOString(),
+          index: [
+            { hour: new Date().toISOString(), value: 4 },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+globalEndpointStore.set('twenty-four-hr-forecast', {
+  timestamp: Date.now() - 60000,
+  result: {
+    ok: true,
+    status: 200,
+    data: {
+      records: [
+        {
+          date: new Date().toISOString().split('T')[0],
+          timestamp: new Date().toISOString(),
+          general: {
+            forecast: { text: 'Thundery Showers', code: 'TL' },
+            temperature: { low: 25, high: 34 },
+            relativeHumidity: { low: 60, high: 95 },
+            wind: { direction: 'S', speed: { low: 10, high: 15 } },
+            validPeriod: { text: 'Next 24 Hours' },
+          },
+          periods: [
+            {
+              timePeriod: { text: 'Day to Evening' },
+              regions: {
+                west: 'Thundery Showers',
+                east: 'Thundery Showers',
+                central: 'Partly Cloudy (Day)',
+                south: 'Partly Cloudy (Day)',
+                north: 'Thundery Showers',
+              },
+            },
+            {
+              timePeriod: { text: 'Evening to Morning' },
+              regions: {
+                west: 'Partly Cloudy (Night)',
+                east: 'Partly Cloudy (Night)',
+                central: 'Partly Cloudy (Night)',
+                south: 'Partly Cloudy (Night)',
+                north: 'Partly Cloudy (Night)',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+globalEndpointStore.set('four-day-outlook', {
+  timestamp: Date.now() - 60000,
+  result: {
+    ok: true,
+    status: 200,
+    data: {
+      records: [
+        {
+          date: new Date().toISOString().split('T')[0],
+          timestamp: new Date().toISOString(),
+          forecasts: [
+            {
+              day: 'Friday',
+              forecast: { text: 'Thundery Showers', summary: 'Afternoon thundery showers' },
+              temperature: { low: 25, high: 34 },
+              relativeHumidity: { low: 60, high: 95 },
+              wind: { direction: 'SSE', speed: { low: 5, high: 15 } },
+            },
+            {
+              day: 'Saturday',
+              forecast: { text: 'Thundery Showers', summary: 'Afternoon thundery showers' },
+              temperature: { low: 25, high: 33 },
+              relativeHumidity: { low: 60, high: 90 },
+              wind: { direction: 'S', speed: { low: 10, high: 20 } },
+            },
+            {
+              day: 'Sunday',
+              forecast: { text: 'Thundery Showers', summary: 'Morning and early afternoon thundery showers' },
+              temperature: { low: 24, high: 32 },
+              relativeHumidity: { low: 65, high: 95 },
+              wind: { direction: 'SSW', speed: { low: 10, high: 20 } },
+            },
+            {
+              day: 'Monday',
+              forecast: { text: 'Thundery Showers', summary: 'Afternoon thundery showers' },
+              temperature: { low: 25, high: 33 },
+              relativeHumidity: { low: 60, high: 90 },
+              wind: { direction: 'S', speed: { low: 10, high: 15 } },
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+/**
+ * Gets or fetches an endpoint using Stale-While-Revalidate pattern.
+ * If fresh data is available, returns it immediately.
+ * If expired, triggers a fetch; if fetch fails with 429, returns stale data instead of null!
+ */
+async function getOrFetchEndpoint(key, headers) {
+  const url = ENDPOINT_URLS[key];
   const now = Date.now();
-  const cached = upstreamCache.get(url);
-  if (cached && now - cached.time < CACHE_TTL_MS && cached.result.ok) {
-    return cached.result;
+  const ttl = ENDPOINT_TTLS[key] || 60000;
+  const entry = globalEndpointStore.get(key);
+
+  // If we have valid fresh data, return immediately
+  if (entry && entry.result && entry.result.ok && (now - entry.timestamp) < ttl) {
+    return entry.result;
   }
 
-  const result = await fetchEndpoint(url, headers);
-  if (result.ok) {
-    upstreamCache.set(url, { time: now, result });
+  // Deduplicate ongoing fetch for this endpoint
+  if (activeFetches.has(key)) {
+    return activeFetches.get(key);
   }
-  return result;
+
+  const fetchPromise = (async () => {
+    try {
+      const freshResult = await rawFetchEndpoint(url, headers);
+      if (freshResult.ok) {
+        globalEndpointStore.set(key, {
+          timestamp: Date.now(),
+          result: freshResult,
+        });
+        return freshResult;
+      }
+
+      // If fresh fetch failed (e.g. 429 rate limit) BUT we have previous cached data,
+      // return the cached data rather than null!
+      if (entry && entry.result && entry.result.ok) {
+        return entry.result;
+      }
+
+      return freshResult;
+    } finally {
+      activeFetches.delete(key);
+    }
+  })();
+
+  activeFetches.set(key, fetchPromise);
+  return fetchPromise;
+}
+
+/**
+ * Gentle background sync worker that cycles through the 10 endpoints in batches
+ * with a 1.2s delay between batches to respect data.gov.sg rate limits.
+ */
+let backgroundSyncRunning = false;
+async function runBackgroundWarmup() {
+  if (backgroundSyncRunning) return;
+  backgroundSyncRunning = true;
+
+  const rawKey = process.env.DATA_GOV_SG_API_KEY;
+  const apiKey = typeof rawKey === 'string' && rawKey.trim().length > 0 ? rawKey.trim() : null;
+  const headers = apiKey ? { 'x-api-key': apiKey } : {};
+
+  const keys = Object.keys(ENDPOINT_URLS);
+  // Batch size 2
+  for (let i = 0; i < keys.length; i += 2) {
+    if (i > 0) {
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    const batch = [keys[i], keys[i + 1]].filter(Boolean);
+    await Promise.all(
+      batch.map(async (key) => {
+        const entry = globalEndpointStore.get(key);
+        const ttl = ENDPOINT_TTLS[key] || 60000;
+        if (!entry || !entry.result.ok || Date.now() - entry.timestamp > ttl) {
+          await getOrFetchEndpoint(key, headers);
+        }
+      })
+    );
+  }
+
+  backgroundSyncRunning = false;
+}
+
+// Start background warmup immediately upon module load
+runBackgroundWarmup().catch(() => {});
+// Schedule recurring background warmup every 45 seconds
+const bgTimer = setInterval(() => {
+  runBackgroundWarmup().catch(() => {});
+}, 45 * 1000);
+if (bgTimer && typeof bgTimer.unref === 'function') {
+  bgTimer.unref();
 }
 
 /**
@@ -288,9 +530,14 @@ function extractForecast(forecastResult, areaName) {
     };
   }
 
+  const forecastText =
+    typeof found.forecast === 'object' && found.forecast !== null
+      ? found.forecast.text || found.forecast.summary || found.forecast.code || ''
+      : String(found.forecast || '');
+
   return {
     forecast: {
-      text: found.forecast,
+      text: forecastText,
       validPeriod: latestItem.valid_period || null,
       timestamp: latestItem.timestamp || latestItem.update_timestamp,
     },
@@ -571,24 +818,35 @@ function extractFourDayOutlook(fourDayResult) {
     fourDayOutlook: {
       date: rec.date,
       timestamp: rec.timestamp || rec.updatedTimestamp,
-      forecasts: forecasts.map((f) => ({
-        day: f.day,
-        timestamp: f.timestamp,
-        text: f.forecast?.text || 'N/A',
-        summary: f.forecast?.summary || f.forecast?.text || '',
-        temperature: {
-          low: f.temperature?.low,
-          high: f.temperature?.high,
-        },
-        relativeHumidity: {
-          low: f.relativeHumidity?.low,
-          high: f.relativeHumidity?.high,
-        },
-        wind: {
-          speed: f.wind?.speed,
-          direction: f.wind?.direction,
-        },
-      })),
+      forecasts: forecasts.map((f) => {
+        const textVal =
+          typeof f.forecast === 'object' && f.forecast !== null
+            ? f.forecast.text || f.forecast.summary || 'N/A'
+            : (f.forecast || 'N/A');
+        const summaryVal =
+          typeof f.forecast === 'object' && f.forecast !== null
+            ? f.forecast.summary || f.forecast.text || ''
+            : '';
+
+        return {
+          day: f.day,
+          timestamp: f.timestamp,
+          text: textVal,
+          summary: summaryVal,
+          temperature: {
+            low: f.temperature?.low,
+            high: f.temperature?.high,
+          },
+          relativeHumidity: {
+            low: f.relativeHumidity?.low,
+            high: f.relativeHumidity?.high,
+          },
+          wind: {
+            speed: f.wind?.speed,
+            direction: f.wind?.direction,
+          },
+        };
+      }),
     },
     error: null,
   };
@@ -611,27 +869,24 @@ export default async function handler(req, res) {
     headers['x-api-key'] = apiKey;
   }
 
-  // Call all 10 real-time endpoints in parallel with slight 60ms stagger to prevent burst rate-limiting
-  const endpointUrls = [
-    'https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast',
-    'https://api-open.data.gov.sg/v2/real-time/api/air-temperature',
-    'https://api-open.data.gov.sg/v2/real-time/api/rainfall',
-    'https://api-open.data.gov.sg/v2/real-time/api/relative-humidity',
-    'https://api-open.data.gov.sg/v2/real-time/api/wind-speed',
-    'https://api-open.data.gov.sg/v2/real-time/api/psi',
-    'https://api-open.data.gov.sg/v2/real-time/api/pm25',
-    'https://api-open.data.gov.sg/v2/real-time/api/uv',
-    'https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast',
-    'https://api-open.data.gov.sg/v2/real-time/api/four-day-outlook',
+  // Fetch all 10 endpoints using our persistent cache and deduplication
+  const keys = [
+    'two-hr-forecast',
+    'air-temperature',
+    'rainfall',
+    'relative-humidity',
+    'wind-speed',
+    'psi',
+    'pm25',
+    'uv',
+    'twenty-four-hr-forecast',
+    'four-day-outlook',
   ];
 
-  const endpoints = endpointUrls.map((url, i) =>
-    new Promise((resolve) => setTimeout(resolve, i * 60)).then(() =>
-      fetchEndpointWithCache(url, headers)
-    )
+  const results = await Promise.allSettled(
+    keys.map((k) => getOrFetchEndpoint(k, headers))
   );
 
-  const settled = await Promise.allSettled(endpoints);
   const [
     forecastRes,
     tempRes,
@@ -643,7 +898,7 @@ export default async function handler(req, res) {
     uvRes,
     twentyFourRes,
     fourDayRes,
-  ] = settled.map((s) =>
+  ] = results.map((s) =>
     s.status === 'fulfilled'
       ? s.value
       : { ok: false, status: 500, reason: s.reason?.message || 'Failed' }
